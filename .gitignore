@@ -1,0 +1,9 @@
+# 忽略 /soild_beam/abaqus/ 目录下的所有文件
+/soild_beam/abaqus/*
+# 但保留三种指定的文件类型
+!/soild_beam/abaqus/*.inp
+!/soild_beam/abaqus/*.cae
+!/soild_beam/abaqus/*.jnl
+
+/soild_beam/dealii_code_v1/build/
+/soild_beam/dealii_code_v1/.vscode/
