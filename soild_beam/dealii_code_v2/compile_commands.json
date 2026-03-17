@@ -1,0 +1,8 @@
+[
+{
+  "directory": "/home/workspace/practical_project/dealii/soild_beam/dealii_code_v2/build",
+  "command": "/usr/bin/g++ -DBOOST_ATOMIC_DYN_LINK -DBOOST_ATOMIC_NO_LIB -DBOOST_IOSTREAMS_DYN_LINK -DBOOST_IOSTREAMS_NO_LIB -DBOOST_SERIALIZATION_DYN_LINK -DBOOST_SERIALIZATION_NO_LIB -DBOOST_SYSTEM_DYN_LINK -DBOOST_SYSTEM_NO_LIB -DBOOST_THREAD_DYN_LINK -DBOOST_THREAD_NO_LIB -DKOKKOS_DEPENDENCE -DNDEBUG -isystem /usr/lib/x86_64-linux-gnu/openmpi/include -isystem /usr/lib/x86_64-linux-gnu/openmpi/include/openmpi -isystem /usr/include/petsc -isystem /usr/include/kokkos -isystem /usr/include/trilinos -isystem /usr/include/scotch -isystem /usr/include/hdf5/openmpi -isystem /usr/include/suitesparse -isystem /usr/local/include/magic_enum -isystem /usr/include/opencascade -isystem /usr/include/slepc -isystem /usr/local/include/symengine/utilities/cereal/include -isystem /usr/include/flint -isystem /usr/include/vtk-9.1 -std=gnu++20 -pedantic -Wall -Wextra -Wmissing-braces -Woverloaded-virtual -Wpointer-arith -Wsign-compare -Wsuggest-override -Wswitch -Wsynth -Wwrite-strings -Wno-placement-new -Wno-literal-suffix -Wno-psabi -Wno-unused-local-typedefs -fopenmp-simd -O2 -funroll-loops -funroll-all-loops -Wno-unused-parameter -o CMakeFiles/soild_beam.dir/soild_beam.cc.o -c /home/workspace/practical_project/dealii/soild_beam/dealii_code_v2/soild_beam.cc",
+  "file": "/home/workspace/practical_project/dealii/soild_beam/dealii_code_v2/soild_beam.cc",
+  "output": "CMakeFiles/soild_beam.dir/soild_beam.cc.o"
+}
+]

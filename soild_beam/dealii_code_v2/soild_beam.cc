@@ -28,6 +28,18 @@
 
 #include <deal.II/base/timer.h>
 
+// --- 【新增】MPI 与并行网格分割工具 ---
+#include <deal.II/base/mpi.h>
+#include <deal.II/base/index_set.h>
+#include <deal.II/grid/grid_tools.h>
+
+// --- 【新增】Trilinos 并行代数库 ---
+#include <deal.II/lac/trilinos_vector.h>
+#include <deal.II/lac/trilinos_sparse_matrix.h>
+#include <deal.II/lac/trilinos_solver.h>
+#include <deal.II/lac/trilinos_precondition.h>
+#include <deal.II/lac/sparsity_tools.h>
+
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -38,7 +50,7 @@ using namespace dealii;
 template <int dim>
 class SoildBeam{
 public:
-    SoildBeam(const string inp_path);
+    SoildBeam(const std::string inp_path);
     void run();
 
 private:
@@ -56,11 +68,25 @@ private:
 
     AffineConstraints<double> constraints;
 
-    SparsityPattern sparsity_pattern;
-    SparseMatrix<double> system_matrix;
+    // 【新增】MPI 通信器与自由度归属账本
+    MPI_Comm mpi_communicator;
+    IndexSet locally_owned_dofs;    // 属于我的自由度
+    IndexSet locally_relevant_dofs; // 我能看见的自由度（含幽灵节点）
 
-    Vector<double> solution;
-    Vector<double> system_rhs;
+    // 【修改】原生的 SparsityPattern 和 SparseMatrix 替换为 Trilinos
+    TrilinosWrappers::SparseMatrix system_matrix;
+
+    // 串行版本代码
+    // SparsityPattern sparsity_pattern;
+    // SparseMatrix<double> system_matrix;
+
+    // 【修改】原生 Vector 替换为 Trilinos::MPI::Vector
+    TrilinosWrappers::MPI::Vector solution;
+    TrilinosWrappers::MPI::Vector system_rhs;
+
+    // Vector<double> solution;
+    // Vector<double> system_rhs;
+
     // inp文件路径
     string inp_path;
 
@@ -82,11 +108,13 @@ void right_hand_side(const std::vector<Point<dim>> &points,
 
 }
 
+// 注意这里要把 mpi_communicator 传给计时器，这样多个核心的时间才会自动统计。
 template <int dim>
-SoildBeam<dim>::SoildBeam(const string inp_path)
-:dof_handler(triangulation), fe(FE_Q<dim>(1) ^ dim), inp_path(inp_path),
+SoildBeam<dim>::SoildBeam(const std::string inp_path)
+:mpi_communicator(MPI_COMM_WORLD),  // 初始化全局通信域
+dof_handler(triangulation), fe(FE_Q<dim>(1) ^ dim), inp_path(inp_path),
 timer_file("timer_summary.txt"),
-computing_timer(timer_file, TimerOutput::summary, TimerOutput::wall_times){
+computing_timer(mpi_communicator, timer_file, TimerOutput::summary, TimerOutput::wall_times){
 
 }
 
@@ -122,36 +150,74 @@ void SoildBeam<dim>::setup_boundary_ids(){
     }
 }
 
-template<int dim>
+// 重写函数
+// template<int dim>
+// void SoildBeam<dim>::setup_system(){
+//     // 【新增】哨兵：它会自动记录整个 setup_system 函数的耗时，标签名为 "1. Assemble system"
+//     TimerOutput::Scope t(computing_timer, "1. setup_system");
+
+//     dof_handler.distribute_dofs(fe);
+//     solution.reinit(dof_handler.n_dofs());
+//     system_rhs.reinit(dof_handler.n_dofs());
+
+//     constraints.clear();
+//     DoFTools::make_hanging_node_constraints(dof_handler, constraints);
+//     VectorTools::interpolate_boundary_values(
+//         dof_handler,
+//         types::boundary_id(1),
+//         Functions::ZeroFunction<dim>(dim),
+//         constraints
+//     );
+//     constraints.close();
+
+//     DynamicSparsityPattern dsp(dof_handler.n_dofs(), dof_handler.n_dofs());
+//     DoFTools::make_sparsity_pattern(
+//         dof_handler,
+//         dsp,
+//         constraints,
+//         /**keep_constrained_dofs = */false
+//     );
+//     sparsity_pattern.copy_from(dsp);
+
+//     system_matrix.reinit(sparsity_pattern);
+// }
+template <int dim>
 void SoildBeam<dim>::setup_system(){
-    // 【新增】哨兵：它会自动记录整个 setup_system 函数的耗时，标签名为 "1. Assemble system"
     TimerOutput::Scope t(computing_timer, "1. setup_system");
 
-    dof_handler.distribute_dofs(fe);
-    solution.reinit(dof_handler.n_dofs());
-    system_rhs.reinit(dof_handler.n_dofs());
+    // 获取当前 MPI 环境的总核数和自己的编号
+    const unsigned int n_mpi_processes = Utilities::MPI::n_mpi_processes(mpi_communicator);
 
+    // 【核心 1】呼叫 METIS 将全局网格打上分区标签
+    GridTools::partition_triangulation(n_mpi_processes, triangulation);
+
+    dof_handler.distribute_dofs(fe);
+
+    // 【核心 2】获取自由度账本
+    locally_owned_dofs = dof_handler.locally_owned_dofs();
+    DoFTools::extract_locally_relevant_dofs(dof_handler, locally_relevant_dofs);
+
+    // 初始化带幽灵节点的分布式向量
+    solution.reinit(locally_owned_dofs, locally_relevant_dofs, mpi_communicator);
+    system_rhs.reinit(locally_owned_dofs, mpi_communicator);
+
+    // 约束必须基于 relevant_dofs 构建，否则处理悬挂节点会崩溃
     constraints.clear();
+    constraints.reinit(locally_relevant_dofs);
     DoFTools::make_hanging_node_constraints(dof_handler, constraints);
     VectorTools::interpolate_boundary_values(
-        dof_handler,
-        types::boundary_id(1),
-        Functions::ZeroFunction<dim>(dim),
-        constraints
+        dof_handler, types::boundary_id(1), Functions::ZeroFunction(dim), constraints
     );
     constraints.close();
 
-    DynamicSparsityPattern dsp(dof_handler.n_dofs(), dof_handler.n_dofs());
-    DoFTools::make_sparsity_pattern(
-        dof_handler,
-        dsp,
-        constraints,
-        /*keep_constrained_dofs = */false
-    );
-    sparsity_pattern.copy_from(dsp);
+    // 【核心 3】通过 MPI 自动构建和分发矩阵稀疏图
+    DynamicSparsityPattern dsp(locally_relevant_dofs);
+    DofTools::make_sparsity_pattern(dof_handler, dsp, constraints, false);
+    SparsityTools::distribute_sparsity_pattern(dsp, locally_owned_dofs, mpi_communicator, locally_owned_dofs);
 
-    system_matrix.reinit(sparsity_pattern);
+    system_matrix.reinit(locally_owned_dofs, locally_owned_dofs, dsp, mpi_communicator);
 }
+
 
 template<int dim>
 void SoildBeam<dim>::assemble_system(){
@@ -200,8 +266,18 @@ void SoildBeam<dim>::assemble_system(){
 
     std::vector<Tensor<1, dim>> rhs_values(n_q_points);
 
+    // 【新增】获取当前 MPI 进程的编号
+    const unsigned int this_mpi_process = Utilities::MPI::this_mpi_process(mpi_communicator);
+
     // 对所有单元进行遍历
     for(const auto &cell : dof_handler.active_cell_iterators()){
+        // ==========================================
+        // 【核心修改】只处理属于当前进程的单元！
+        // ==========================================
+        if(cell->subdomain_id() != this_mpi_process){
+            continue;
+        }
+
         fe_values.reinit(cell);
 
         cell_matrix = 0;
@@ -294,6 +370,12 @@ void SoildBeam<dim>::assemble_system(){
             cell_matrix, cell_rhs, local_dof_indices, system_matrix, system_rhs
         );
     }
+
+    // ==========================================
+    // 【核心修改】所有进程在循环结束后碰头，通过网络把边界缝合处的数据相加
+    // ==========================================
+    system_matrix.compress(VectorOperation::add);
+    system_rhs.compress(VectorOperation::add);
 }
 
 template <int dim>
@@ -451,7 +533,10 @@ void SoildBeam<dim>::run(){
     deallog.detach();
 }
 
-int main(){
+int main(int argc, char *argv[]){
+    // 【核心修改】初始化底层的 MPI 通信域、Trilinos 和相关环境
+    Utilities::MPI::MPI_InitFinalize mpi_initialization(argc, argv, 1);
+
     SoildBeam<3> soild_beam("../Job-1.inp");
     soild_beam.run();
 }
