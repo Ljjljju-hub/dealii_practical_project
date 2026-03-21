@@ -1,6 +1,7 @@
 #include <deal.II/base/quadrature_lib.h>
 #include <deal.II/base/function.h>
 #include <deal.II/base/tensor.h>
+#include <deal.II/base/point.h>
 
 #include <deal.II/lac/vector.h>
 #include <deal.II/lac/full_matrix.h>
@@ -31,7 +32,11 @@
 // --- 【新增】MPI 与并行网格分割工具 ---
 #include <deal.II/base/mpi.h>
 #include <deal.II/base/index_set.h>
+// 划分算法已实现于 GridTools 命名空间中
+// dof_renumbering包含一个 DoFRenumbering
+// 可对与自由度相关的索引进行排序，使其根据所属子域进行编号：
 #include <deal.II/grid/grid_tools.h>
+ #include <deal.II/dofs/dof_renumbering.h>
 
 // --- 【新增】Trilinos 并行代数库 ---
 #include <deal.II/lac/trilinos_vector.h>
@@ -43,6 +48,8 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+// 将标准输出 std::cout 替换为一个新的流 pcout，该流在并行计算中用于仅在其中一个 MPI 进程上生成输出。
+#include <deal.II/base/conditional_ostream.h>
 
 using namespace std;
 using namespace dealii;
@@ -61,17 +68,20 @@ private:
     void refine_grid();
     void output_results(const unsigned int cycle) const;
 
+    // 【新增】MPI 通信器与自由度归属账本
+    MPI_Comm mpi_communicator;
+    IndexSet locally_owned_dofs;    // 属于我的自由度
+    IndexSet locally_relevant_dofs; // 我能看见的自由度（含幽灵节点）
+
+    const unsigned int n_mpi_processes;
+    const unsigned int this_mpi_process;
+
     Triangulation<dim> triangulation;
     DoFHandler<dim> dof_handler;
 
     const FESystem<dim> fe;
 
     AffineConstraints<double> constraints;
-
-    // 【新增】MPI 通信器与自由度归属账本
-    MPI_Comm mpi_communicator;
-    IndexSet locally_owned_dofs;    // 属于我的自由度
-    IndexSet locally_relevant_dofs; // 我能看见的自由度（含幽灵节点）
 
     // 【修改】原生的 SparsityPattern 和 SparseMatrix 替换为 Trilinos
     TrilinosWrappers::SparseMatrix system_matrix;
@@ -88,13 +98,17 @@ private:
     // Vector<double> system_rhs;
 
     // inp文件路径
-    string inp_path;
+    std::string inp_path;
 
     // 1. 先声明文件流（必须在计时器前面！）
     std::ofstream timer_file;
+
+
     // 【新增】高级性能剖析计时器
     // output_results声明为const
     // 在output_results内是需要修改TimerOutput的，添加mutable
+    // mpi中TimerOutput记录时间的对象，传入的是普通的“std::ofstream timer_file;”
+    // 但是可以正确在mpi环境下只输出一次内容.
     mutable TimerOutput computing_timer;
 
 };  // end of Class SoildBeam
@@ -112,10 +126,15 @@ void right_hand_side(const std::vector<Point<dim>> &points,
 template <int dim>
 SoildBeam<dim>::SoildBeam(const std::string inp_path)
 :mpi_communicator(MPI_COMM_WORLD),  // 初始化全局通信域
+n_mpi_processes(Utilities::MPI::n_mpi_processes(mpi_communicator)),
+this_mpi_process(Utilities::MPI::this_mpi_process(mpi_communicator)),
 dof_handler(triangulation), fe(FE_Q<dim>(1) ^ dim), inp_path(inp_path),
-timer_file("timer_summary.txt"),
+// timer_file("timer_summary.txt"), 先不进行初始化
 computing_timer(mpi_communicator, timer_file, TimerOutput::summary, TimerOutput::wall_times){
-
+    // 【核心修复】只允许 0 号进程真正去触碰硬盘，打开文件
+    if (this_mpi_process == 0) {
+        timer_file.open("timer_summary.txt");
+    }
 }
 
 // 搜索位移边界的节点，为位移边界节点设置id
@@ -185,37 +204,40 @@ template <int dim>
 void SoildBeam<dim>::setup_system(){
     TimerOutput::Scope t(computing_timer, "1. setup_system");
 
-    // 获取当前 MPI 环境的总核数和自己的编号
-    const unsigned int n_mpi_processes = Utilities::MPI::n_mpi_processes(mpi_communicator);
-
     // 【核心 1】呼叫 METIS 将全局网格打上分区标签
     GridTools::partition_triangulation(n_mpi_processes, triangulation);
 
     dof_handler.distribute_dofs(fe);
+    // 对域从新调整编号
+    DoFRenumbering::subdomain_wise(dof_handler);
 
     // 【核心 2】获取自由度账本
-    locally_owned_dofs = dof_handler.locally_owned_dofs();
-    DoFTools::extract_locally_relevant_dofs(dof_handler, locally_relevant_dofs);
+    // locally_owned_dofs = dof_handler.locally_owned_dofs(); 旧版语法
+    // DoFTools::extract_locally_relevant_dofs(dof_handler, locally_relevant_dofs);
+    locally_relevant_dofs = DoFTools::extract_locally_relevant_dofs(dof_handler);
 
-    // 初始化带幽灵节点的分布式向量
-    solution.reinit(locally_owned_dofs, locally_relevant_dofs, mpi_communicator);
-    system_rhs.reinit(locally_owned_dofs, mpi_communicator);
 
     // 约束必须基于 relevant_dofs 构建，否则处理悬挂节点会崩溃
     constraints.clear();
-    constraints.reinit(locally_relevant_dofs);
     DoFTools::make_hanging_node_constraints(dof_handler, constraints);
     VectorTools::interpolate_boundary_values(
-        dof_handler, types::boundary_id(1), Functions::ZeroFunction(dim), constraints
+        dof_handler, types::boundary_id(1), Functions::ZeroFunction<dim>(dim), constraints
     );
     constraints.close();
 
     // 【核心 3】通过 MPI 自动构建和分发矩阵稀疏图
-    DynamicSparsityPattern dsp(locally_relevant_dofs);
-    DofTools::make_sparsity_pattern(dof_handler, dsp, constraints, false);
-    SparsityTools::distribute_sparsity_pattern(dsp, locally_owned_dofs, mpi_communicator, locally_owned_dofs);
+    DynamicSparsityPattern dsp(dof_handler.n_dofs(), dof_handler.n_dofs());
+    DoFTools::make_sparsity_pattern(dof_handler, dsp, constraints, false);
+
+    const std::vector<IndexSet> locally_owned_dofs_per_proc = 
+        DoFTools::locally_owned_dofs_per_subdomain(dof_handler);
+    const IndexSet &locally_owned_dofs = 
+        locally_owned_dofs_per_proc[this_mpi_process];
 
     system_matrix.reinit(locally_owned_dofs, locally_owned_dofs, dsp, mpi_communicator);
+
+    solution.reinit(locally_owned_dofs, mpi_communicator);
+    system_rhs.reinit(locally_owned_dofs, mpi_communicator);
 }
 
 
@@ -383,38 +405,89 @@ void SoildBeam<dim>::solve(){
     TimerOutput::Scope t(computing_timer, "3. solve");
 
     SolverControl solver_control(100000, 1e-6 * system_rhs.l2_norm());
-    SolverCG<Vector<double>> cg(solver_control);
+    // SolverCG<Vector<double>> cg(solver_control);
+    SolverCG<TrilinosWrappers::MPI::Vector> cg(solver_control);
 
-    PreconditionSSOR<SparseMatrix<double>> preconditioner;
-    preconditioner.initialize(system_matrix, 1.2);
+    // PreconditionSSOR<SparseMatrix<double>> preconditioner;
+    // preconditioner.initialize(system_matrix, 1.2);
 
+    // 呼叫 Trilinos 的 ILU (Block-Jacobi ILU)
+    TrilinosWrappers::PreconditionILU preconditioner;
+    preconditioner.initialize(system_matrix);
+    
+
+    // cg.solve(system_matrix, solution, system_rhs, preconditioner);
     cg.solve(system_matrix, solution, system_rhs, preconditioner);
 
     // ==========================================
     // 【新增】输出 CG 求解器的实际迭代步数
     // ==========================================
-    deallog << "   CG iterations: " << solver_control.last_step() << std::endl;
+    // 只有 0 号核心负责打印迭代步数，避免被 4 个核心刷屏
+    if(Utilities::MPI::this_mpi_process(mpi_communicator) == 0){
+        deallog << "   CG iterations: " << solver_control.last_step() << std::endl;
+    }
 
-    constraints.distribute(solution);
+    // 左边的 Vector<double> 是 deal.II 原生的单机串行向量。
+    // 右边的 solution 是 PETSc/Trilinos 的分布式向量。
+    // 执行过程: 所有节点同时向网络上广播自己手里那的解向量数据
+    // localized_solution是完整自由度的解向量
+    Vector<double> localized_solution(solution);
+    constraints.distribute(localized_solution);
+
+    solution = localized_solution;
 }
 
 template <int dim>
 void SoildBeam<dim>::refine_grid(){
     TimerOutput::Scope t(computing_timer, "4. refine_grid");
 
-    Vector<float> estimated_error_per_cell(triangulation.n_active_cells());
+    /*
+    家共享着同一张完整地图，那么每一次更新地图，所有人的动作必须做到 100% 绝对一致！
+    如果在细化网格时，0 号进程觉得 A 单元误差大，把它细分了；而 1 号进程觉得 A 单元误差小，没细分。
+    那么在下一秒进入 setup_system 时，这两个进程的网格拓扑就彻底对不上了，程序会瞬间崩溃。
+
+    */
+    // 第一步：强行看全图（获取完整位移场）
+    // 【极其关键】阶段一：强制把分布式的 solution 收集到单机的原生 Vector 里
+    // 这样所有的节点都有完整的位移场，可以各自完整地计算误差并细化全局网格
+    Vector<double> localized_solution(solution);
+
+    // 第二步：各扫门前雪（只算本地误差）
+    Vector<float> local_error_per_cell(triangulation.n_active_cells());
     
+    // KellyErrorEstimator<dim>::estimate(
+    //     dof_handler,
+    //     QGauss<dim-1>(fe.degree+1),
+    //     {},
+    //     solution,
+    //     estimated_error_per_cell
+    // );
     KellyErrorEstimator<dim>::estimate(
         dof_handler,
-        QGauss<dim-1>(fe.degree+1),
+        QGauss<dim - 1>(fe.degree + 1),
         {},
-        solution,
-        estimated_error_per_cell
+        localized_solution,
+        local_error_per_cell,
+        ComponentMask(),
+        nullptr,
+        MultithreadInfo::n_threads(),
+        this_mpi_process
     );
 
+    // 第三步：【神级替换】丢掉恶心的 Trilinos 代数向量，直接用纯正的 MPI 底层通信！
+    // 意思是：把所有进程的 local_error_per_cell 加起来(MPI_SUM)，存到 localized_all_errors 里
+    Vector<float> localized_all_errors(triangulation.n_active_cells());
+    MPI_Allreduce(local_error_per_cell.begin(),
+                  localized_all_errors.begin(),
+                  triangulation.n_active_cells(),
+                  MPI_FLOAT,
+                  MPI_SUM,
+                  mpi_communicator);
+
+    // 第四步：所有人拿着完整且一模一样的误差名单，同时切分网格
     GridRefinement::refine_and_coarsen_fixed_number(
         triangulation,
-        estimated_error_per_cell,
+        localized_all_errors, // 【修复 A】传入正确的变量名
         0.1,
         0.03
     );
@@ -426,32 +499,38 @@ template <int dim>
 void SoildBeam<dim>::output_results(const unsigned int cycle) const{
     TimerOutput::Scope t(computing_timer, "5. output_results");
 
-    DataOut<dim> data_out;
-    data_out.attach_dof_handler(dof_handler);
+    // 同理，收集到单机向量中，并强制只有 0 号节点负责写入文件！
+    // 否则 4 个节点同时往一个 vtk 里写，文件直接损坏。
+    Vector<double> localized_solution(solution);
 
-    std::vector<std::string> solution_names;
-    switch (dim){
-        case 1:
-            solution_names.emplace_back("displacement");
-            break;
-        case 2:
-            solution_names.emplace_back("x_displacement");
-            solution_names.emplace_back("y_displacement");
-            break;
-        case 3:
-            solution_names.emplace_back("x_displacement");
-            solution_names.emplace_back("y_displacement");
-            solution_names.emplace_back("z_displacement");
-            break;
-        default:
-            DEAL_II_NOT_IMPLEMENTED();
+    if(Utilities::MPI::this_mpi_process(mpi_communicator) == 0){
+            DataOut<dim> data_out;
+        data_out.attach_dof_handler(dof_handler);
+
+        std::vector<std::string> solution_names;
+        switch (dim){
+            case 1:
+                solution_names.emplace_back("displacement");
+                break;
+            case 2:
+                solution_names.emplace_back("x_displacement");
+                solution_names.emplace_back("y_displacement");
+                break;
+            case 3:
+                solution_names.emplace_back("x_displacement");
+                solution_names.emplace_back("y_displacement");
+                solution_names.emplace_back("z_displacement");
+                break;
+            default:
+                DEAL_II_NOT_IMPLEMENTED();
+        }
+
+        data_out.add_data_vector(solution, solution_names);
+        data_out.build_patches();
+
+        std::ofstream output("solution-" + std::to_string(cycle) + ".vtk");
+        data_out.write_vtk(output);
     }
-
-    data_out.add_data_vector(solution, solution_names);
-    data_out.build_patches();
-
-    std::ofstream output("solution-" + std::to_string(cycle) + ".vtk");
-    data_out.write_vtk(output);
 }
 
 template <int dim>
@@ -459,8 +538,10 @@ void SoildBeam<dim>::run(){
     // 1. 创建文件流
     ofstream log("log.txt");
 
-    // 2. 将文件流挂载到 deal.II 的全局日志流上
+    if (Utilities::MPI::this_mpi_process(mpi_communicator) == 0){
+        // 2. 将文件流挂载到 deal.II 的全局日志流上
     deallog.attach(log);
+    }
 
     // (可选) 设置输出前缀的深度，让排版更整洁
     deallog.depth_console(2);
@@ -469,8 +550,10 @@ void SoildBeam<dim>::run(){
         // 在每轮循环开始时启动秒表
         Timer cycle_timer;
 
-        // 现在只需要写一次！它会自动同时显示在屏幕终端并写入 log.txt
-        deallog << "Cycle" << ": " << cycle << std::endl;
+        if (this_mpi_process == 0) {
+            // 现在只需要写一次！它会自动同时显示在屏幕终端并写入 log.txt
+            deallog << "Cycle" << ": " << cycle << std::endl;
+        }
 
         if(cycle==0){
             // 读取inp文件
@@ -486,7 +569,9 @@ void SoildBeam<dim>::run(){
             // 5. 调用专门读取 Abaqus 格式的解析函数
             grid_in.read_abaqus(input_file);
 
-            deallog << "Successfully read mesh from: " << inp_path << std::endl;
+            if (this_mpi_process == 0) {
+                deallog << "Successfully read mesh from: " << inp_path << std::endl;
+            }
 
             // 6. （极其关键的一步）网格读取完毕后，立刻调用你之前写的打标签函数！
             setup_boundary_ids();
@@ -495,12 +580,16 @@ void SoildBeam<dim>::run(){
             refine_grid();
         }
 
-        deallog << "   Number of active cells:       "
-                    << triangulation.n_active_cells() << std::endl;
+        if (this_mpi_process == 0) {
+            deallog << "   Number of active cells:       "
+                        << triangulation.n_active_cells() << std::endl;
+        }
 
         setup_system();
-        deallog << "   Number of degrees of freedom: " << dof_handler.n_dofs()
-                    << std::endl;
+        if (this_mpi_process == 0) {
+            deallog << "   Number of degrees of freedom: " << dof_handler.n_dofs()
+                        << std::endl;
+        }
 
         assemble_system();
         solve();
@@ -509,19 +598,23 @@ void SoildBeam<dim>::run(){
         // 这是记录总时间
         // 在一轮循环结束时停止秒表，并输出时间
         cycle_timer.stop();
-        deallog << "   Time taken for this cycle:    " 
-                << cycle_timer.wall_time() << " seconds." << std::endl;
-        deallog << "-----------------------------------------------" << std::endl;
+        if (this_mpi_process == 0) {
+            deallog << "   Time taken for this cycle:    " 
+                    << cycle_timer.wall_time() << " seconds." << std::endl;
+            deallog << "-----------------------------------------------" << std::endl;
+        }
         // 这是记录每部分的时间，有两个不同的文件
         // =========================================================
         // 【新增】在每一轮结束时，向文件写入华丽的分割线和当前 Cycle 标记
         // =========================================================
-        timer_file << "\n=========================================================\n"
-                   << "               Performance Summary: Cycle " << cycle << "\n"
-                   << "               Active Cells: " << triangulation.n_active_cells() << "\n"
-                   << "               DoFs:         " << dof_handler.n_dofs() << "\n"
-                   << "=========================================================\n";
-                   
+        if (this_mpi_process == 0) {
+            timer_file << "\n=========================================================\n"
+                    << "               Performance Summary: Cycle " << cycle << "\n"
+                    << "               Active Cells: " << triangulation.n_active_cells() << "\n"
+                    << "               DoFs:         " << dof_handler.n_dofs() << "\n"
+                    << "=========================================================\n"
+                    << std::flush; // 【新增】写完立刻强制推入硬盘！;
+        }
         // 打印本轮的成绩单到 timer_file 里
         computing_timer.print_summary();
         
